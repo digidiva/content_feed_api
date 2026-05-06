@@ -55,6 +55,24 @@ DATABASES = {
     }
 }
 
+_REDIS_URL = os.environ.get('REDIS_URL')
+
+CACHES = {
+    'default': (
+        {
+            'BACKEND': 'django_redis.cache.RedisCache',
+            'LOCATION': _REDIS_URL,
+            'OPTIONS': {'CLIENT_CLASS': 'django_redis.client.DefaultClient'},
+        }
+        if _REDIS_URL
+        else {
+            'BACKEND': 'django.core.cache.backends.locmem.LocMemCache',
+        }
+    )
+}
+
+CONTENT_DETAIL_CACHE_TTL = int(os.environ.get('CONTENT_DETAIL_CACHE_TTL', 60))
+
 AUTH_PASSWORD_VALIDATORS = [
     {
         'NAME': 'django.contrib.auth.password_validation.UserAttributeSimilarityValidator',

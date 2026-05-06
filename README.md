@@ -62,15 +62,69 @@ export POSTGRES_PORT=5432
 
 ## API Endpoints
 
-- `POST /api/contents/` - create content
-- `GET /api/contents/` - list content
-- `GET /api/contents/{id}/` - content detail
-- `POST /api/reactions/` - create or update a reaction
-- `POST /api/comments/` - add a comment or reply
+### Content
+
+| Method | Endpoint | Description |
+|--------|----------|-------------|
+| `POST` | `/api/contents/` | Create content |
+| `GET` | `/api/contents/` | List content (cursor-paginated) |
+| `GET` | `/api/contents/{id}/` | Content detail with comment preview |
+| `PUT` | `/api/contents/{id}/` | Full update content |
+| `PATCH` | `/api/contents/{id}/` | Partial update content |
+| `DELETE` | `/api/contents/{id}/` | Delete content |
+
+**List query params:** `creator_id`, `is_active`, `search`, `page_size`, `cursor`
+
+**Content detail — `comments` field structure:**
+```json
+{
+  "results": [{ "id": 1, "user": {}, "text": "...", "created_at": "...", "parent_id": null, "reply_count": 3 }],
+  "has_more": true
+}
+```
+Returns up to 10 top-level comments. Use the comments list endpoint to paginate further.
+
+---
+
+### Reactions
+
+| Method | Endpoint | Description |
+|--------|----------|-------------|
+| `POST` | `/api/reactions/` | Create or update a reaction (`like` / `dislike`) |
+| `DELETE` | `/api/reactions/` | Undo (deactivate) a reaction |
+
+**Request body:** `user_id`, `content_id`, `reaction` (`like` or `dislike`)
+
+---
+
+### Comments
+
+| Method | Endpoint | Description |
+|--------|----------|-------------|
+| `POST` | `/api/comments/` | Add a comment or reply |
+| `GET` | `/api/contents/{id}/comments/` | Paginated top-level comments for content |
+| `GET` | `/api/comments/{id}/replies/` | Paginated direct replies to a comment |
+
+**`POST /api/comments/` body:** `user_id`, `content_id`, `text`, `parent_id` (optional — omit for top-level)
+
+**Comment list / replies response shape (cursor-paginated):**
+```json
+{
+  "next": "http://...",
+  "previous": null,
+  "results": [{ "id": 1, "user": {}, "text": "...", "created_at": "...", "parent_id": null, "reply_count": 2 }]
+}
+```
+
+`reply_count` is the number of direct replies. Call `GET /api/comments/{id}/replies/` recursively to load deeper levels.
+
+**Query params for list endpoints:** `page_size`, `cursor`
 
 ## Notes
 
-- Uses default Django `User` model for creator, reaction owner, and comment author.
+- Uses the default Django `User` model for creator, reaction owner, and comment author.
 - Uses SQLite by default for local development (`db.sqlite3`).
-- Queryset annotations include like, dislike, and comment counts.
+- `like_count`, `dislike_count`, and `comment_count` are denormalized fields on `Content`, updated atomically with `F()` expressions on every reaction/comment write.
+- Content detail responses are cached in Redis (`REDIS_URL` env var). Falls back to in-memory cache when `REDIS_URL` is not set.
+- All list endpoints use cursor pagination (set `CONTENT_DETAIL_CACHE_TTL` env var to control cache TTL, default 60s).
 - Uses `select_related` and `prefetch_related` to avoid N+1 query issues.

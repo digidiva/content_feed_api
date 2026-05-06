@@ -1,8 +1,10 @@
 import logging
 
+from django.conf import settings
+from django.core.cache import cache
 from django.core.exceptions import PermissionDenied as DjangoPermissionDenied
 from django.db import IntegrityError, transaction
-from django.db.models import Count, Q, Prefetch
+from django.db.models import Count, F, Prefetch
 from django.http import Http404
 from django.shortcuts import get_object_or_404
 from rest_framework import filters, generics, status, viewsets
@@ -11,8 +13,10 @@ from rest_framework.response import Response
 from rest_framework.views import APIView
 
 from .models import Comment, Content, Reaction
+from .pagination import CommentCursorPagination, ContentCursorPagination
 from .serializers import (
     CommentCreateSerializer,
+    CommentListSerializer,
     ContentDetailSerializer,
     ContentListSerializer,
     ReactionSerializer,
@@ -20,6 +24,27 @@ from .serializers import (
 )
 
 logger = logging.getLogger(__name__)
+
+
+def _update_reaction_counters(content_id, *, add=None, remove=None):
+    """Apply F()-based like/dislike counter deltas atomically in a single UPDATE."""
+    like_delta = dislike_delta = 0
+    if add == Reaction.LIKE:
+        like_delta += 1
+    elif add == Reaction.DISLIKE:
+        dislike_delta += 1
+    if remove == Reaction.LIKE:
+        like_delta -= 1
+    elif remove == Reaction.DISLIKE:
+        dislike_delta -= 1
+
+    updates = {}
+    if like_delta:
+        updates['like_count'] = F('like_count') + like_delta
+    if dislike_delta:
+        updates['dislike_count'] = F('dislike_count') + dislike_delta
+    if updates:
+        Content.objects.filter(pk=content_id).update(**updates)
 
 
 class LoggedExceptionMixin:
@@ -53,11 +78,10 @@ class LoggedExceptionMixin:
 
 
 class ContentViewSet(LoggedExceptionMixin, viewsets.ModelViewSet):
-    queryset = Content.objects.all()
-    filter_backends = [filters.SearchFilter, filters.OrderingFilter]
+    queryset = Content.objects.none()  # overridden by get_queryset; required for router basename inference
+    pagination_class = ContentCursorPagination
+    filter_backends = [filters.SearchFilter]
     search_fields = ['title']
-    ordering_fields = ['created_at', 'like_count']
-    ordering = ['-created_at']
 
     def get_serializer_class(self):
         if self.action == 'retrieve':
@@ -65,22 +89,7 @@ class ContentViewSet(LoggedExceptionMixin, viewsets.ModelViewSet):
         return ContentListSerializer
 
     def get_queryset(self):
-        queryset = (
-            Content.objects.select_related('creator')
-            .annotate(
-                like_count=Count(
-                    'reactions',
-                    filter=Q(reactions__reaction=Reaction.LIKE, reactions__is_active=True),
-                    distinct=True,
-                ),
-                dislike_count=Count(
-                    'reactions',
-                    filter=Q(reactions__reaction=Reaction.DISLIKE, reactions__is_active=True),
-                    distinct=True,
-                ),
-                comment_count=Count('comments', distinct=True),
-            )
-        )
+        queryset = Content.objects.select_related('creator')
 
         creator_id = self.request.query_params.get('creator_id')
         is_active = self.request.query_params.get('is_active')
@@ -96,16 +105,39 @@ class ContentViewSet(LoggedExceptionMixin, viewsets.ModelViewSet):
             queryset = queryset.filter(is_active=active_filters[normalized_is_active])
 
         if self.action == 'retrieve':
-            comments_prefetch = Prefetch(
-                'comments',
-                queryset=Comment.objects.select_related('user').order_by('created_at'),
+            queryset = queryset.prefetch_related(
+                Prefetch(
+                    'comments',
+                    queryset=Comment.objects.select_related('user').order_by('created_at'),
+                )
             )
-            queryset = queryset.prefetch_related(comments_prefetch)
 
         return queryset
 
-    def perform_create(self, serializer):
-        serializer.save()
+    def retrieve(self, request, *args, **kwargs):
+        cache_key = f"content_detail:{kwargs['pk']}"
+        cached = cache.get(cache_key)
+        if cached is not None:
+            return Response(cached)
+        instance = self.get_object()
+        data = self.get_serializer(instance).data
+        cache.set(cache_key, data, timeout=settings.CONTENT_DETAIL_CACHE_TTL)
+        return Response(data)
+
+    def update(self, request, *args, **kwargs):
+        response = super().update(request, *args, **kwargs)
+        cache.delete(f"content_detail:{kwargs['pk']}")
+        return response
+
+    def partial_update(self, request, *args, **kwargs):
+        response = super().partial_update(request, *args, **kwargs)
+        cache.delete(f"content_detail:{kwargs['pk']}")
+        return response
+
+    def destroy(self, request, *args, **kwargs):
+        response = super().destroy(request, *args, **kwargs)
+        cache.delete(f"content_detail:{kwargs['pk']}")
+        return response
 
 
 class ReactionCreateUpdateView(LoggedExceptionMixin, APIView):
@@ -118,28 +150,44 @@ class ReactionCreateUpdateView(LoggedExceptionMixin, APIView):
 
         try:
             with transaction.atomic():
-                reaction_obj, created = Reaction.objects.update_or_create(
-                    user=user,
-                    content=content,
-                    defaults={'reaction': reaction_value, 'is_active': True},
+                existing = (
+                    Reaction.objects
+                    .select_for_update()
+                    .filter(user=user, content=content)
+                    .first()
                 )
+                if existing is None:
+                    reaction_obj = Reaction.objects.create(
+                        user=user, content=content,
+                        reaction=reaction_value, is_active=True,
+                    )
+                    created = True
+                    _update_reaction_counters(content.id, add=reaction_value)
+                else:
+                    old_reaction, old_is_active = existing.reaction, existing.is_active
+                    existing.reaction = reaction_value
+                    existing.is_active = True
+                    existing.save(update_fields=['reaction', 'is_active', 'updated_at'])
+                    reaction_obj = existing
+                    created = False
+                    if not old_is_active:
+                        _update_reaction_counters(content.id, add=reaction_value)
+                    elif old_reaction != reaction_value:
+                        _update_reaction_counters(content.id, add=reaction_value, remove=old_reaction)
         except IntegrityError:
+            # Extremely rare: two concurrent requests both saw no existing row
             logger.warning(
-                'Concurrent duplicate reaction write resolved',
-                extra={
-                    'user_id': user.id,
-                    'content_id': content.id,
-                    'reaction': reaction_value,
-                },
+                'Concurrent reaction create race condition',
+                extra={'user_id': user.id, 'content_id': content.id},
             )
             reaction_obj = Reaction.objects.get(user=user, content=content)
-            reaction_obj.reaction = reaction_value
-            reaction_obj.is_active = True
-            reaction_obj.save(update_fields=['reaction', 'is_active', 'updated_at'])
             created = False
 
-        output_serializer = ReactionSerializer(reaction_obj)
-        return Response(output_serializer.data, status=status.HTTP_201_CREATED if created else status.HTTP_200_OK)
+        cache.delete(f'content_detail:{content.id}')
+        return Response(
+            ReactionSerializer(reaction_obj).data,
+            status=status.HTTP_201_CREATED if created else status.HTTP_200_OK,
+        )
 
     def delete(self, request, *args, **kwargs):
         serializer = ReactionUndoSerializer(data=request.data)
@@ -147,20 +195,18 @@ class ReactionCreateUpdateView(LoggedExceptionMixin, APIView):
         user = serializer.validated_data['user']
         content = serializer.validated_data['content']
 
-        reaction_obj = get_object_or_404(
-            Reaction.objects.select_related('user', 'content'),
-            user=user,
-            content=content,
-        )
+        reaction_obj = get_object_or_404(Reaction, user=user, content=content)
         if not reaction_obj.is_active:
             return Response(
                 {'detail': 'Reaction is already inactive.'},
                 status=status.HTTP_200_OK,
             )
 
-        reaction_obj.is_active = False
-        reaction_obj.save(update_fields=['is_active', 'updated_at'])
-
+        with transaction.atomic():
+            reaction_obj.is_active = False
+            reaction_obj.save(update_fields=['is_active', 'updated_at'])
+            _update_reaction_counters(content.id, remove=reaction_obj.reaction)
+        cache.delete(f'content_detail:{content.id}')
         return Response(status=status.HTTP_204_NO_CONTENT)
 
 
@@ -168,4 +214,36 @@ class CommentCreateView(LoggedExceptionMixin, generics.CreateAPIView):
     serializer_class = CommentCreateSerializer
 
     def perform_create(self, serializer):
-        serializer.save()
+        instance = serializer.save()
+        Content.objects.filter(pk=instance.content_id).update(comment_count=F('comment_count') + 1)
+        cache.delete(f'content_detail:{instance.content_id}')
+
+
+class ContentCommentListView(LoggedExceptionMixin, generics.ListAPIView):
+    serializer_class = CommentListSerializer
+    pagination_class = CommentCursorPagination
+
+    def get_queryset(self):
+        get_object_or_404(Content.objects.only('id'), pk=self.kwargs['content_pk'])
+        return (
+            Comment.objects
+            .filter(content_id=self.kwargs['content_pk'], parent__isnull=True)
+            .select_related('user')
+            .annotate(reply_count=Count('replies'))
+            .order_by('created_at', 'id')
+        )
+
+
+class CommentRepliesView(LoggedExceptionMixin, generics.ListAPIView):
+    serializer_class = CommentListSerializer
+    pagination_class = CommentCursorPagination
+
+    def get_queryset(self):
+        get_object_or_404(Comment.objects.only('id'), pk=self.kwargs['pk'])
+        return (
+            Comment.objects
+            .filter(parent_id=self.kwargs['pk'])
+            .select_related('user')
+            .annotate(reply_count=Count('replies'))
+            .order_by('created_at', 'id')
+        )

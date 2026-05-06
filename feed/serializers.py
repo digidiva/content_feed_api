@@ -12,22 +12,6 @@ class UserSerializer(serializers.ModelSerializer):
         fields = ['id', 'username', 'first_name', 'last_name']
 
 
-class RecursiveField(serializers.Serializer):
-    def to_representation(self, value):
-        serializer = self.parent.parent.__class__(value, context=self.context)
-        return serializer.data
-
-
-class CommentSerializer(serializers.ModelSerializer):
-    user = UserSerializer(read_only=True)
-    replies = RecursiveField(many=True, read_only=True)
-
-    class Meta:
-        model = Comment
-        fields = ['id', 'user', 'text', 'created_at', 'parent', 'replies']
-        read_only_fields = ['id', 'user', 'created_at', 'replies']
-
-
 class CommentCreateSerializer(serializers.ModelSerializer):
     user_id = serializers.PrimaryKeyRelatedField(
         queryset=User.objects.all(),
@@ -189,6 +173,18 @@ class ContentBaseSerializer(serializers.ModelSerializer):
         return value
 
 
+_COMMENT_PREVIEW_LIMIT = 10
+
+
+class CommentListSerializer(serializers.ModelSerializer):
+    user = UserSerializer(read_only=True)
+    reply_count = serializers.IntegerField(read_only=True)
+
+    class Meta:
+        model = Comment
+        fields = ['id', 'user', 'text', 'created_at', 'parent_id', 'reply_count']
+
+
 class ContentDetailSerializer(ContentBaseSerializer):
     comments = serializers.SerializerMethodField()
 
@@ -196,35 +192,35 @@ class ContentDetailSerializer(ContentBaseSerializer):
         fields = ContentBaseSerializer.Meta.fields + ['comments']
 
     def get_comments(self, obj):
-        prefetched_comments = getattr(obj, '_prefetched_objects_cache', {}).get('comments')
-        if prefetched_comments is not None:
-            comments = list(prefetched_comments)
-        else:
-            comments = list(obj.comments.select_related('user').order_by('created_at'))
+        comments = list(obj.comments.all())
 
-        children_by_parent = {}
+        user_cache = {}
+
+        def get_user_data(user):
+            if user.id not in user_cache:
+                user_cache[user.id] = UserSerializer(user).data
+            return user_cache[user.id]
+
+        reply_counts = {}
         for comment in comments:
-            children_by_parent.setdefault(comment.parent_id, []).append(comment)
+            if comment.parent_id is not None:
+                reply_counts[comment.parent_id] = reply_counts.get(comment.parent_id, 0) + 1
 
-        def serialize_comment(comment):
-            return {
-                'id': comment.id,
-                'user': UserSerializer(comment.user).data,
-                'text': comment.text,
-                'created_at': comment.created_at,
-                'parent': comment.parent_id,
-                'replies': [
-                    serialize_comment(reply)
-                    for reply in children_by_parent.get(comment.id, [])
-                ],
-            }
-
-        return [
-            serialize_comment(comment)
-            for comment in children_by_parent.get(None, [])
-        ]
+        top_level = [c for c in comments if c.parent_id is None]
+        return {
+            'results': [
+                {
+                    'id': c.id,
+                    'user': get_user_data(c.user),
+                    'text': c.text,
+                    'created_at': c.created_at,
+                    'parent_id': c.parent_id,
+                    'reply_count': reply_counts.get(c.id, 0),
+                }
+                for c in top_level[:_COMMENT_PREVIEW_LIMIT]
+            ],
+            'has_more': len(top_level) > _COMMENT_PREVIEW_LIMIT,
+        }
 
 
-class ContentListSerializer(ContentBaseSerializer):
-    class Meta(ContentBaseSerializer.Meta):
-        fields = ContentBaseSerializer.Meta.fields
+ContentListSerializer = ContentBaseSerializer
